@@ -187,7 +187,7 @@ export default function Register() {
           </Form.Item>
           <Space style={{ width: '100%' }}>
             <Form.Item name="count" label="批量数量" style={{ flex: 1 }}>
-              <Input type="number" min={1} />
+              <Input type="number" min={1} max={300} />
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" style={{ flex: 1 }}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />

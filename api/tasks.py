@@ -35,7 +35,7 @@ class RegisterTaskRequest(BaseModel):
     platform: str
     email: Optional[str] = None
     password: Optional[str] = None
-    count: int = 1
+    count: int = Field(default=1, ge=1, le=300)
     concurrency: int = 1
     register_delay_seconds: float = 0
     proxy: Optional[str] = None
@@ -169,6 +169,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         if merged_extra.get("luckmail_base_url"):
                             account.extra.setdefault("luckmail_base_url", merged_extra.get("luckmail_base_url"))
                 saved_account = save_account(account)
+                if hasattr(_mailbox, "mark_allocation_result"):
+                    _mailbox.mark_allocation_result(success=True)
                 if _proxy: proxy_pool.report_success(_proxy)
                 _log(task_id, f"✓ 注册成功: {account.email}")
                 _save_task_log(req.platform, account.email, "success")
@@ -180,6 +182,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         _tasks[task_id].setdefault("cashier_urls", []).append(cashier_url)
                 return True
             except Exception as e:
+                if '_mailbox' in locals() and hasattr(_mailbox, "mark_allocation_result"):
+                    _mailbox.mark_allocation_result(success=False, error=str(e))
                 if _proxy: proxy_pool.report_fail(_proxy)
                 _log(task_id, f"✗ 注册失败: {e}")
                 _save_task_log(req.platform, req.email or "", "failed", error=str(e))

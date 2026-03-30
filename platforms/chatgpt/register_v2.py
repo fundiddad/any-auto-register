@@ -46,7 +46,7 @@ class RegistrationEngineV2:
         browser_mode: str = "protocol",
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
-        max_retries: int = 3,
+        max_retries: int = 2,
         extra_config: Optional[dict] = None,
     ):
         self.email_service = email_service

@@ -742,10 +742,10 @@ export default function Accounts() {
         {!taskId ? (
           <Form form={registerForm} layout="vertical" onFinish={handleRegister}>
             <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} max={99} />
+              <Input type="number" min={1} max={300} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} max={5} />
+              <Input type="number" min={1} max={10} />
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />

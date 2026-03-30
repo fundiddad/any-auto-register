@@ -56,3 +56,9 @@ CLAUDE.md
 .ace-tool/
 smstome*_numbers.txt
 smstome_used/
+
+# 本地缓存与临时文件
+.codex-backups/
+.pip-cache/
+.tmp/
+frontend/.npm-cache/

@@ -114,6 +114,9 @@ class LuckMailHttpClient:
             self._sync_session = curl_requests.Session(
                 impersonate=self.impersonate,
                 timeout=self.timeout,
+                # LuckMail 直连公网接口时不应继承宿主环境里的代理变量，
+                # 否则像 127.0.0.1:9 这类占位代理会导致所有请求直接失败。
+                trust_env=False,
             )
         return self._sync_session
 
@@ -123,6 +126,8 @@ class LuckMailHttpClient:
             self._async_session = curl_requests.AsyncSession(
                 impersonate=self.impersonate,
                 timeout=self.timeout,
+                # 与同步会话保持一致，避免环境代理污染 LuckMail 请求。
+                trust_env=False,
             )
         return self._async_session
 

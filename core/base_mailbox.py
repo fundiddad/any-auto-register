@@ -90,13 +90,21 @@ class BaseMailbox(ABC):
 def create_mailbox(provider: str, extra: dict = None, proxy: str = None) -> 'BaseMailbox':
     """工厂方法：根据 provider 创建对应的 mailbox 实例"""
     extra = extra or {}
+
+    # 配置页会把“未填写”保存为空字符串，不能直接覆盖代码里的默认地址。
+    def _pick_value(key: str, default: str) -> str:
+        value = extra.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text or default
     if provider == "tempmail_lol":
         return TempMailLolMailbox(proxy=proxy)
     elif provider == "duckmail":
         return DuckMailMailbox(
-            api_url=(extra.get("duckmail_api_url") or "https://www.duckmail.sbs"),
-            provider_url=(extra.get("duckmail_provider_url") or "https://api.duckmail.sbs"),
-            bearer=(extra.get("duckmail_bearer") or "kevin273945"),
+            api_url=_pick_value("duckmail_api_url", "https://www.duckmail.sbs"),
+            provider_url=_pick_value("duckmail_provider_url", "https://api.duckmail.sbs"),
+            bearer=_pick_value("duckmail_bearer", "kevin273945"),
             proxy=proxy,
         )
     elif provider == "freemail":
@@ -109,7 +117,7 @@ def create_mailbox(provider: str, extra: dict = None, proxy: str = None) -> 'Bas
         )
     elif provider == "moemail":
         return MoeMailMailbox(
-            api_url=extra.get("moemail_api_url", "https://sall.cc"),
+            api_url=_pick_value("moemail_api_url", "https://sall.cc"),
             proxy=proxy,
         )
     elif provider == "cfworker":
@@ -712,6 +720,86 @@ class LuckMailMailbox(BaseMailbox):
         self._order_no = None
         self._token = None
         self._email = None
+        self._active_purchase = None
+
+    def _load_used_purchase_keys(self) -> tuple[set[str], set[str]]:
+        # 复用策略以本地数据库为准：邮箱或 mailbox_token 已落库，就视为已经使用过。
+        from sqlmodel import Session, select
+        from .db import AccountModel, engine
+        from .luckmail_reuse_store import load_blocked_keys
+
+        used_emails: set[str] = set()
+        used_tokens: set[str] = set()
+        with Session(engine) as session:
+            rows = session.exec(select(AccountModel.email, AccountModel.extra_json)).all()
+
+        for email, extra_json in rows:
+            email_text = str(email or "").strip().lower()
+            if email_text:
+                used_emails.add(email_text)
+            try:
+                extra = json.loads(extra_json or "{}")
+            except Exception:
+                extra = {}
+            token = str(
+                extra.get("mailbox_token")
+                or extra.get("token")
+                or ""
+            ).strip()
+            if token:
+                used_tokens.add(token)
+        blocked_emails, blocked_tokens = load_blocked_keys()
+        used_emails.update(blocked_emails)
+        used_tokens.update(blocked_tokens)
+        return used_emails, used_tokens
+
+    def mark_allocation_result(self, success: bool, error: str = "") -> None:
+        # 仅对已购邮箱复用/购买分支打标，订单接码分支不写这份记录。
+        from .luckmail_reuse_store import save_result
+
+        if not self._active_purchase:
+            return
+        save_result(
+            email=self._active_purchase.get("email", ""),
+            token=self._active_purchase.get("token", ""),
+            project_code=self._active_purchase.get("project_code", ""),
+            status="success" if success else "failed",
+            last_error=error,
+        )
+
+    def _pick_reusable_purchase(self):
+        # 优先复用最新且未在本地使用过的已购邮箱，避免重复消耗 LuckMail 配额。
+        used_emails, used_tokens = self._load_used_purchase_keys()
+        try:
+            purchases = self._client.user.get_purchases(
+                page=1,
+                page_size=100,
+                keyword=None,
+            )
+        except Exception as exc:
+            self._log(f"[LuckMail] 查询已购邮箱失败，将退回购买流程: {exc}")
+            return None
+
+        items = list(purchases.list or [])
+        items.sort(key=lambda item: str(item.created_at or ""), reverse=True)
+        for item in items:
+            email = str(item.email_address or "").strip()
+            token = str(item.token or "").strip()
+            if not email or not token:
+                continue
+            if int(getattr(item, "user_disabled", 0) or 0) != 0:
+                continue
+            if int(getattr(item, "status", 1) or 0) != 1:
+                continue
+            if email.lower() in used_emails or token in used_tokens:
+                continue
+            return {
+                "email_address": email,
+                "token": token,
+                "warranty_until": getattr(item, "warranty_until", None),
+                "created_at": getattr(item, "created_at", None),
+            }
+        return None
 
     def _use_purchase_mode(self, account: MailboxAccount = None) -> bool:
         if account and account.account_id and str(account.account_id).startswith("tok_"):
@@ -775,9 +863,34 @@ class LuckMailMailbox(BaseMailbox):
 
         if self._use_purchase_mode():
             self._log(
-                f"[LuckMail] 分支: ChatGPT + LuckMail -> 购买邮箱接口 "
+                f"[LuckMail] 分支: ChatGPT + LuckMail -> 优先复用已购邮箱，复用不到再购买 "
                 f"(project_code={self._project_code}, email_type={self._email_type or '-'}, domain={self._domain or '-'})"
             )
+            reused_item = self._pick_reusable_purchase()
+            if reused_item:
+                email = str(reused_item.get("email_address") or "").strip()
+                token = str(reused_item.get("token") or "").strip()
+                self._email = email
+                self._token = token
+                self._active_purchase = {
+                    "email": email,
+                    "token": token,
+                    "project_code": self._project_code,
+                }
+                self._log(f"[LuckMail] 复用未使用已购邮箱: {email}")
+                if reused_item.get("warranty_until"):
+                    self._log(f"[LuckMail] 质保到期: {reused_item.get('warranty_until')}")
+                return MailboxAccount(
+                    email=email,
+                    account_id=token,
+                    extra={
+                        "provider": "luckmail",
+                        "token": token,
+                        "project_code": self._project_code,
+                        "reused_purchase": True,
+                    },
+                )
+
             try:
                 result = self._client.user.purchase_emails(
                     project_code=self._project_code,
@@ -800,7 +913,12 @@ class LuckMailMailbox(BaseMailbox):
 
             self._email = email
             self._token = token
-            self._log(f"[LuckMail] 已购邮箱: {email}")
+            self._active_purchase = {
+                "email": email,
+                "token": token,
+                "project_code": self._project_code,
+            }
+            self._log(f"[LuckMail] 新购买邮箱: {email}")
             if item.get("warranty_until"):
                 self._log(f"[LuckMail] 质保到期: {item.get('warranty_until')}")
             return MailboxAccount(
@@ -810,6 +928,7 @@ class LuckMailMailbox(BaseMailbox):
                     "provider": "luckmail",
                     "token": token,
                     "project_code": self._project_code,
+                    "reused_purchase": False,
                 },
             )
 
