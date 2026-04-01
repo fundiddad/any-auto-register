@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import {
   Table,
   Button,
@@ -55,6 +55,58 @@ function normalizeAccount(account: any) {
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
   const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
   return { ...account, extra, cpaSync }
+}
+
+async function fetchAllAccounts(platform: string, search: string, filterStatus: string) {
+  // 账号接口是分页的，这里主动拉全量，避免页面只显示前 100 条。
+  const items: any[] = []
+  let page = 1
+  let total = 0
+
+  while (page === 1 || items.length < total) {
+    const params = new URLSearchParams({
+      platform,
+      page: String(page),
+      page_size: '200',
+    })
+    if (search) params.set('email', search)
+    if (filterStatus) params.set('status', filterStatus)
+    const data = await apiFetch(`/accounts?${params}`)
+    const pageItems = Array.isArray(data.items) ? data.items : []
+    total = Number(data.total || 0)
+    items.push(...pageItems.map(normalizeAccount))
+    if (pageItems.length === 0) break
+    page += 1
+  }
+
+  return items
+}
+
+async function fetchChatgptCpaStatuses(emails: string[]) {
+  const cleanEmails = Array.from(new Set(emails.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)))
+  if (cleanEmails.length === 0) return {}
+  const result = await apiFetch('/integrations/chatgpt/cpa-statuses', {
+    method: 'POST',
+    body: JSON.stringify({ emails: cleanEmails }),
+  })
+  return Object.fromEntries(
+    ((result.items || []) as any[]).map((item) => [
+      String(item.email || '').trim().toLowerCase(),
+      {
+        uploaded: Boolean(item.uploaded),
+        uploaded_at: item.uploaded_at || '',
+        last_message: item.last_message || '',
+      },
+    ]),
+  ) as Record<string, { uploaded: boolean; uploaded_at?: string; last_message?: string }>
+}
+
+function mergeCpaStatuses(items: any[], cpaStatuses: Record<string, { uploaded: boolean; uploaded_at?: string; last_message?: string }>) {
+  return items.map((item) => {
+    const remote = cpaStatuses[String(item.email || '').trim().toLowerCase()]
+    if (!remote) return item
+    return { ...item, cpaSync: { ...item.cpaSync, ...remote } }
+  })
 }
 
 function formatSyncTime(value?: string) {
@@ -283,12 +335,16 @@ function ActionMenu({ acc, onRefresh }: { acc: any; onRefresh: () => void }) {
 
 export default function Accounts() {
   const { platform } = useParams<{ platform: string }>()
+  const navigate = useNavigate()
   const [currentPlatform, setCurrentPlatform] = useState(platform || 'trae')
+  const [platformOptions, setPlatformOptions] = useState<{ value: string; label: string }[]>([])
   const [accounts, setAccounts] = useState<any[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
+  const [filterCpa, setFilterCpa] = useState<'uploaded' | 'not_uploaded' | ''>('')
+  const [pageSize, setPageSize] = useState(20)
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
@@ -304,25 +360,49 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
-  const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
+  const [cpaSyncLoading, setCpaSyncLoading] = useState<'oauth' | 'selected' | ''>('')
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
   }, [platform])
 
+  useEffect(() => {
+    // 平台列表走后端配置，避免前端写死。
+    apiFetch('/platforms')
+      .then((items) => {
+        setPlatformOptions(
+          (items || []).map((item: any) => ({
+            value: item.name,
+            label: item.display_name || item.name,
+          })),
+        )
+      })
+      .catch(() => {})
+  }, [])
+
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ platform: currentPlatform, page: '1', page_size: '100' })
-      if (search) params.set('email', search)
-      if (filterStatus) params.set('status', filterStatus)
-      const data = await apiFetch(`/accounts?${params}`)
-      setAccounts((data.items || []).map(normalizeAccount))
-      setTotal(data.total)
+      let items = await fetchAllAccounts(currentPlatform, search, filterStatus)
+      if (currentPlatform === 'chatgpt') {
+        try {
+          const cpaStatuses = await fetchChatgptCpaStatuses(items.map((item) => item.email))
+          items = mergeCpaStatuses(items, cpaStatuses)
+        } catch {
+          // CPA 查询失败时保留本地状态，避免页面直接不可用。
+        }
+      }
+      if (filterCpa === 'uploaded') {
+        items = items.filter((item: any) => Boolean(item.cpaSync?.uploaded || item.cpaSync?.uploaded_at))
+      } else if (filterCpa === 'not_uploaded') {
+        items = items.filter((item: any) => !Boolean(item.cpaSync?.uploaded || item.cpaSync?.uploaded_at))
+      }
+      setAccounts(items)
+      setTotal(items.length)
     } finally {
       setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus])
+  }, [currentPlatform, search, filterStatus, filterCpa])
 
   useEffect(() => {
     load()
@@ -513,37 +593,29 @@ export default function Accounts() {
     })
   }
 
-  const handleCpaBackfill = async (mode: 'pending' | 'selected') => {
+  const handleCpaBackfill = async (mode: 'selected') => {
     if (currentPlatform !== 'chatgpt') return
 
-    const body: Record<string, unknown> = {
-      platforms: ['chatgpt'],
-    }
+    const accountIds = Array.from(selectedRowKeys)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
 
-    if (mode === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-
-      if (accountIds.length === 0) {
-        message.warning('请先选择要上传的账号')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.pending_only = true
-      if (filterStatus) body.status = filterStatus
-      if (search) body.email = search
+    if (accountIds.length === 0) {
+      message.warning('请先选择要上传到 CPA 的账号')
+      return
     }
 
     setCpaSyncLoading(mode)
     try {
       const result = await apiFetch('/integrations/backfill', {
         method: 'POST',
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          platforms: ['chatgpt'],
+          account_ids: accountIds,
+        }),
       })
 
-      const actionLabel = mode === 'selected' ? '所选账号 CPA 上传' : '未上传账号 CPA 补传'
+      const actionLabel = '所选账号上传 CPA'
       if (!result.total) {
         message.info('没有可处理的账号')
       } else if (!result.failed) {
@@ -558,6 +630,54 @@ export default function Accounts() {
       await load()
     } catch (e: any) {
       message.error(`CPA 上传失败: ${e.message}`)
+    } finally {
+      setCpaSyncLoading('')
+    }
+  }
+
+  const handleSelectedOauthBackfill = async () => {
+    if (currentPlatform !== 'chatgpt') return
+
+    // 这里只处理勾选账号里缺 refresh_token 的项，避免重复跑已有 OAuth 的账号。
+    const targetIds = accounts
+      .filter((item) => selectedRowKeys.includes(item.id) && !getRefreshToken(item))
+      .map((item) => Number(item.id))
+      .filter((value) => Number.isInteger(value) && value > 0)
+
+    if (selectedRowKeys.length === 0) {
+      message.warning('请先勾选要补 OAuth 的账号')
+      return
+    }
+    if (targetIds.length === 0) {
+      message.info('所选账号都已有 refresh_token，无需补 OAuth')
+      return
+    }
+
+    setCpaSyncLoading('oauth')
+    try {
+      const result = await apiFetch('/integrations/chatgpt/oauth-backfill', {
+        method: 'POST',
+        body: JSON.stringify({
+          account_ids: targetIds,
+          only_enabled: false,
+        }),
+      })
+
+      const actionLabel = '勾选账号补 OAuth 并回传 CPA'
+      if (!result.total) {
+        message.info('没有可处理的账号')
+      } else if (!result.failed) {
+        message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
+      } else if (!result.success) {
+        message.error(`${actionLabel}失败：成功 ${result.success} / ${result.total}`)
+      } else {
+        message.warning(`${actionLabel}部分完成：成功 ${result.success} / ${result.total}`)
+      }
+
+      showCpaSyncResult(`${actionLabel}结果`, result)
+      await load()
+    } catch (e: any) {
+      message.error(`补 OAuth 失败: ${e.message}`)
     } finally {
       setCpaSyncLoading('')
     }
@@ -694,6 +814,17 @@ export default function Accounts() {
             style={{ width: 200 }}
           />
           <Select
+            value={currentPlatform}
+            style={{ width: 160 }}
+            options={platformOptions}
+            onChange={(value) => {
+              setSelectedRowKeys([])
+              setCurrentPlatform(value)
+              navigate(`/accounts/${value}`)
+            }}
+          />
+          <Select
+            value={filterStatus || undefined}
             placeholder="状态筛选"
             allowClear
             style={{ width: 120 }}
@@ -706,6 +837,19 @@ export default function Accounts() {
               { value: 'invalid', label: '已失效' },
             ]}
           />
+          {currentPlatform === 'chatgpt' && (
+            <Select
+              value={filterCpa || undefined}
+              placeholder="CPA筛选"
+              allowClear
+              style={{ width: 140 }}
+              onChange={(value) => setFilterCpa((value || '') as 'uploaded' | 'not_uploaded' | '')}
+              options={[
+                { value: 'uploaded', label: '已上传CPA' },
+                { value: 'not_uploaded', label: '未上传CPA' },
+              ]}
+            />
+          )}
           <Text type="secondary">{total} 个账号</Text>
           {selectedRowKeys.length > 0 && (
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>
@@ -722,13 +866,13 @@ export default function Accounts() {
               </Button>
             </Popconfirm>
           )}
-          {currentPlatform === 'chatgpt' && (
+          {currentPlatform === 'chatgpt' && selectedRowKeys.length > 0 && (
             <Popconfirm
-              title="确认补传当前筛选范围内尚未成功上传 CPA 的账号？"
-              onConfirm={() => handleCpaBackfill('pending')}
+              title="确认对勾选账号中缺 refresh_token 的项补 OAuth 并回传 CPA？"
+              onConfirm={handleSelectedOauthBackfill}
             >
-              <Button loading={cpaSyncLoading === 'pending'} icon={<UploadOutlined />} disabled={total === 0}>
-                补传未上传 CPA
+              <Button loading={cpaSyncLoading === 'oauth'} icon={<UploadOutlined />}>
+                更新勾选账号缺失 OAuth
               </Button>
             </Popconfirm>
           )}
@@ -754,7 +898,14 @@ export default function Accounts() {
           selectedRowKeys,
           onChange: setSelectedRowKeys,
         }}
-        pagination={{ pageSize: 20, showSizeChanger: false }}
+        pagination={{
+          // 用分页大小下拉和快速跳页输入框代替固定分页。
+          pageSize,
+          showSizeChanger: true,
+          showQuickJumper: true,
+          pageSizeOptions: ['5', '10', '20', '50', '100'],
+          onShowSizeChange: (_, size) => setPageSize(size),
+        }}
         onRow={(record) => ({
           onDoubleClick: () => {
             setCurrentAccount(record)

@@ -15,6 +15,7 @@ from services.chatgpt_sync import (
     update_account_model_cli_proxy_state,
     upload_account_model_to_cpa,
 )
+from services.cpa_manager import list_auth_files
 from services.external_apps import install, list_status, start, start_all, stop, stop_all
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -37,6 +38,10 @@ class ChatgptCliProxyMarkRequest(BaseModel):
 class ChatgptOAuthBackfillRequest(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
     only_enabled: bool = True
+
+
+class ChatgptCpaStatusRequest(BaseModel):
+    emails: list[str] = Field(default_factory=list)
 
 
 def _to_account(model: AccountModel) -> Account:
@@ -177,6 +182,44 @@ def backfill_chatgpt_oauth(body: ChatgptOAuthBackfillRequest):
             summary["items"].append(item)
         s.commit()
     return summary
+
+
+@router.post("/chatgpt/cpa-statuses")
+def get_chatgpt_cpa_statuses(body: ChatgptCpaStatusRequest):
+    # 这里直接查询 CPA 的 auth-files，再按邮箱回传给前端，避免页面只看本地缓存状态。
+    wanted = {
+        str(email or "").strip().lower()
+        for email in body.emails
+        if str(email or "").strip()
+    }
+    if not wanted:
+        return {"ok": True, "items": []}
+
+    files = list_auth_files()
+    by_email: dict[str, dict] = {}
+
+    for item in files:
+        raw_email = str(item.get("email", "") or "").strip().lower()
+        raw_name = str(item.get("name", "") or "").strip().lower()
+        if raw_name.endswith(".json"):
+            raw_name = raw_name[:-5]
+        email = raw_email or raw_name
+        if not email or email not in wanted:
+            continue
+
+        status = str(item.get("status", "") or "").strip().lower()
+        uploaded = bool(item.get("name")) and status != "error"
+        candidate = {
+            "email": email,
+            "uploaded": uploaded,
+            "uploaded_at": item.get("last_refresh") or item.get("updated_at") or "",
+            "last_message": str(item.get("status", "") or "").strip(),
+        }
+        previous = by_email.get(email)
+        if previous is None or (not previous.get("uploaded") and uploaded):
+            by_email[email] = candidate
+
+    return {"ok": True, "items": list(by_email.values())}
 
 
 @router.post("/backfill")
