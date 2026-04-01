@@ -133,6 +133,7 @@ class RegistrationEngineV2:
         if not token_data:
             return False, oauth_client.last_error or "OAuth 流程未返回 token"
 
+        token_data["client_id"] = str(token_data.get("client_id") or oauth_client.oauth_client_id or "").strip()
         refresh_token = str(token_data.get("refresh_token") or "").strip()
         if not refresh_token:
             return False, "OAuth 流程成功结束，但未拿到 refresh_token"
@@ -239,6 +240,7 @@ class RegistrationEngineV2:
                         ).strip()
                         result.metadata["oauth_refresh_token_ready"] = True
                         result.metadata["oauth_id_token_ready"] = bool(result.id_token)
+                        result.metadata["oauth_client_id"] = str(oauth_data.get("client_id") or "").strip()
                         self._log("OAuth Token 提取完成，已拿到 refresh_token")
                     else:
                         oauth_error = str(oauth_result or "").strip()

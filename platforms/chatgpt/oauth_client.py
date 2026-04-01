@@ -53,6 +53,7 @@ class OAuthClient:
         self.browser_mode = browser_mode or "protocol"
         self.last_error = ""
 
+        self._refresh_client_id_from_session()
         # 创建 session
         self.session = curl_requests.Session()
         if self.proxy:
@@ -296,6 +297,22 @@ class OAuthClient:
         session_data = self._decode_oauth_session_cookie() or {}
         return bool(session_data.get("workspaces"))
 
+    def _sync_oauth_client_id(self, candidate: str, source: str):
+        """如果流程里暴露出了更准确的 client_id，就用它覆盖默认值。"""
+        resolved = str(candidate or "").strip()
+        if not resolved or resolved == self.oauth_client_id:
+            return
+        self._log(f"更新 OAuth client_id: {resolved} (source={source})")
+        self.oauth_client_id = resolved
+
+    def _refresh_client_id_from_session(self, access_token: str = ""):
+        """只在 OAuth 会话自己暴露 client_id 时更新，避免误用 session access_token 的 client。"""
+        del access_token
+        session_data = self._decode_oauth_session_cookie() or {}
+        session_client_id = str(session_data.get("openai_client_id") or "").strip()
+        if session_client_id:
+            self._sync_oauth_client_id(session_client_id, "oauth_session_cookie")
+
     def _follow_flow_state(
         self,
         state: FlowState,
@@ -513,7 +530,11 @@ class OAuthClient:
             },
         )
         headers.update(generate_datadog_trace())
-        payload = {"username": {"kind": "email", "value": email}}
+        # 旧账号补 OAuth 走的是登录流，不是注册流；明确带上 screen_hint，避免 invalid_auth_step。
+        payload = {
+            "username": {"kind": "email", "value": email},
+            "screen_hint": "login",
+        }
 
         try:
             kwargs = {
@@ -674,6 +695,7 @@ class OAuthClient:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
         """
         self.last_error = ""
+        self._refresh_client_id_from_session()
         self._log("开始 OAuth 登录流程...")
 
         code_verifier, code_challenge = generate_pkce()
@@ -703,6 +725,7 @@ class OAuthClient:
         if not authorize_final_url:
             self._set_error("Bootstrap 失败")
             return None
+        self._refresh_client_id_from_session()
 
         continue_referer = (
             authorize_final_url
@@ -744,6 +767,7 @@ class OAuthClient:
                     code, code_verifier, user_agent, impersonate
                 )
                 if tokens:
+                    tokens["client_id"] = self.oauth_client_id
                     self._log("✅ OAuth 登录成功")
                 else:
                     self._log("换取 tokens 失败")
@@ -817,6 +841,7 @@ class OAuthClient:
                         code, code_verifier, user_agent, impersonate
                     )
                     if tokens:
+                        tokens["client_id"] = self.oauth_client_id
                         self._log("✅ OAuth 登录成功")
                     else:
                         self._log("换取 tokens 失败")
@@ -843,6 +868,7 @@ class OAuthClient:
                         code, code_verifier, user_agent, impersonate
                     )
                     if tokens:
+                        tokens["client_id"] = self.oauth_client_id
                         self._log("✅ OAuth 登录成功")
                     else:
                         self._log("换取 tokens 失败")
@@ -900,6 +926,10 @@ class OAuthClient:
                 impersonate=impersonate,
             )
             if session_data:
+                self._sync_oauth_client_id(
+                    str(session_data.get("openai_client_id") or "").strip(),
+                    "workspace_session",
+                )
                 break
 
             if attempt < max_retries - 1:
@@ -966,8 +996,6 @@ class OAuthClient:
                         return code, self._state_from_url(location)
                 if location:
                     return None, self._state_from_url(location)
-
-            # 如果返回 200，检查响应中的 orgs
             if r.status_code == 200:
                 try:
                     data = r.json()
@@ -1304,7 +1332,12 @@ class OAuthClient:
             r = self.session.post(url, **kwargs)
 
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                if not str(data.get("refresh_token") or "").strip():
+                    self._set_error(
+                        f"Token exchange succeeded but refresh_token is missing (client_id={self.oauth_client_id})"
+                    )
+                return data
             else:
                 self._set_error(f"换取 tokens 失败: {r.status_code} - {r.text[:200]}")
 

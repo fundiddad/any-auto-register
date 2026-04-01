@@ -3,7 +3,7 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-# 为测试注入最小 selectolax stub，避免 import register_v2 时被可选依赖阻塞。
+# ???????? selectolax stub??? import register_v2 ?????????
 fake_selectolax = types.ModuleType("selectolax")
 fake_selectolax_parser = types.ModuleType("selectolax.parser")
 fake_selectolax_parser.HTMLParser = object
@@ -26,6 +26,7 @@ class RegisterV2OAuthTests(unittest.TestCase):
 
         with patch("platforms.chatgpt.register_v2.OAuthClient") as oauth_cls:
             oauth_client = oauth_cls.return_value
+            oauth_client.oauth_client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
             oauth_client.login_and_get_tokens.return_value = {
                 "access_token": "new-at",
                 "refresh_token": "rt-1",
@@ -41,7 +42,7 @@ class RegisterV2OAuthTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(data["refresh_token"], "rt-1")
-        # 必须复用注册阶段 session，才能继承已经建立好的 auth 登录态。
+        self.assertEqual(data["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann")
         self.assertIs(oauth_client.session, chatgpt_client.session)
         oauth_client.login_and_get_tokens.assert_called_once()
 

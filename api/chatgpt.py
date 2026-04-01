@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 from core.db import AccountModel, get_session
 import json, sys
+from platforms.chatgpt.constants import OAUTH_CLIENT_ID
 
 
 router = APIRouter(prefix="/chatgpt", tags=["chatgpt"])
@@ -40,7 +41,7 @@ def _to_codex_account(acc: AccountModel):
     a.refresh_token = extra.get("refresh_token", "")
     a.id_token = extra.get("id_token", "")
     a.session_token = extra.get("session_token", "")
-    a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
+    a.client_id = extra.get("client_id") or OAUTH_CLIENT_ID
     a.cookies = extra.get("cookies", "")
     return a
 

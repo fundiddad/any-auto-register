@@ -6,6 +6,7 @@ import string
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, AccountStatus, BasePlatform, RegisterConfig
 from core.registry import register
+from platforms.chatgpt.constants import OAUTH_CLIENT_ID
 
 
 @register
@@ -160,6 +161,7 @@ class ChatGPTPlatform(BasePlatform):
         if not result or not result.success:
             raise RuntimeError(result.error_message if result else "注册失败")
 
+        client_id = str((result.metadata or {}).get("oauth_client_id") or "").strip() or OAUTH_CLIENT_ID
         return Account(
             platform="chatgpt",
             email=result.email,
@@ -173,6 +175,7 @@ class ChatGPTPlatform(BasePlatform):
                 "id_token": result.id_token,
                 "session_token": result.session_token,
                 "workspace_id": result.workspace_id,
+                "client_id": client_id,
             },
         )
 

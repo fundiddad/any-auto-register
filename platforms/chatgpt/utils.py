@@ -111,6 +111,28 @@ def decode_jwt_payload(token):
         return {}
 
 
+def infer_oauth_client_id(access_token: str, fallback: str = "") -> str:
+    """优先从 access_token 里推导真实 OAuth client_id，避免继续使用过期的硬编码值。"""
+    payload = decode_jwt_payload(access_token)
+    for key in ("client_id", "azp"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+
+    aud = payload.get("aud")
+    if isinstance(aud, list):
+        for item in aud:
+            value = str(item or "").strip()
+            if value.startswith("app_"):
+                return value
+    elif isinstance(aud, str):
+        value = aud.strip()
+        if value.startswith("app_"):
+            return value
+
+    return str(fallback or "").strip()
+
+
 def extract_code_from_url(url):
     """从 URL 中提取 authorization code"""
     if not url or "code=" not in url:
