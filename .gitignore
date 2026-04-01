@@ -8,7 +8,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.csv
+*.csv
 # 数据库
 *.db
 *.sqlite
