@@ -54,7 +54,26 @@ function normalizeAccount(account: any) {
   const extra = parseExtraJson(account.extra_json)
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
   const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
-  return { ...account, extra, cpaSync }
+  const oauthSync = syncStatuses.oauth && typeof syncStatuses.oauth === 'object' ? syncStatuses.oauth : {}
+  return { ...account, extra, cpaSync, oauthSync }
+}
+
+function getOauthStatus(record: any) {
+  const refreshToken = String(record?.extra?.refresh_token || '').trim()
+  if (refreshToken) {
+    return { color: 'success', label: '已有RT', detail: '已拿到 refresh_token' }
+  }
+
+  const oauthSync = record?.oauthSync || {}
+  const status = String(oauthSync.status || '').trim()
+  const lastMessage = String(oauthSync.last_message || '').trim()
+  if (status === 'phone_required') {
+    return { color: 'error', label: '需手机验证', detail: lastMessage || '补 OAuth 时进入 add_phone' }
+  }
+  if (status === 'failed') {
+    return { color: 'warning', label: '上次失败', detail: lastMessage || '上次补 OAuth 失败' }
+  }
+  return { color: 'processing', label: '可尝试免手机', detail: '当前没有 refresh_token，可先尝试直接补 OAuth' }
 }
 
 async function fetchAllAccounts(platform: string, search: string, filterStatus: string) {
@@ -564,10 +583,14 @@ export default function Accounts() {
           msg: syncResult.msg || '',
         })),
       )
-      .filter((item: any) => !item.ok)
-      .map((item: any) => `[${item.platform}] ${item.email || '-'} / ${item.name}: ${item.msg || '失败'}`)
+      .map((item: any) => {
+        const status = item.ok ? 'OK' : 'FAIL'
+        const detail = item.msg || (item.ok ? '成功' : '失败')
+        return `[${status}] [${item.platform}] ${item.email || '-'} / ${item.name}: ${detail}`
+      })
 
-    if (lines.length === 0) return
+    const summaryLine = `总计 ${result.total || 0}，成功 ${result.success || 0}，失败 ${result.failed || 0}`
+    const content = [summaryLine, ...lines].join('\n')
 
     Modal.info({
       title,
@@ -587,7 +610,7 @@ export default function Accounts() {
             wordBreak: 'break-word',
           }}
         >
-          {lines.join('\n')}
+          {content}
         </pre>
       ),
     })
@@ -774,6 +797,22 @@ export default function Accounts() {
 
   if (currentPlatform === 'chatgpt') {
     columns.splice(4, 0, {
+      title: 'OAuth',
+      key: 'oauth_status',
+      render: (_: any, record: any) => {
+        const oauth = getOauthStatus(record)
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 140 }}>
+            <Tag color={oauth.color}>{oauth.label}</Tag>
+            <Text type="secondary" ellipsis={{ tooltip: oauth.detail }} style={{ maxWidth: 220, fontSize: 12 }}>
+              {oauth.detail}
+            </Text>
+          </div>
+        )
+      },
+    })
+
+    columns.splice(5, 0, {
       title: 'CPA',
       key: 'cpa_sync',
       render: (_: any, record: any) => {
@@ -899,8 +938,9 @@ export default function Accounts() {
           onChange: setSelectedRowKeys,
         }}
         pagination={{
-          // 用分页大小下拉和快速跳页输入框代替固定分页。
+          // ?????????????????????
           pageSize,
+          position: ['topRight'],
           showSizeChanger: true,
           showQuickJumper: true,
           pageSizeOptions: ['5', '10', '20', '50', '100'],

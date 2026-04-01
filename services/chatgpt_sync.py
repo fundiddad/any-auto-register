@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from typing import Any
 
 from sqlmodel import Session
 
 from core.db import AccountModel, engine
+from platforms.chatgpt.constants import OAUTH_CLIENT_ID
+
+logger = logging.getLogger(__name__)
 
 CPA_SYNC_NAME = "cpa"
 CLI_PROXY_SYNC_NAME = "cliproxyapi"
+OAUTH_SYNC_NAME = "oauth"
 
 
 def _utcnow() -> datetime:
@@ -50,6 +55,10 @@ def get_cli_proxy_sync_state(extra_or_account: Any) -> dict[str, Any]:
     return _get_sync_state(extra_or_account, CLI_PROXY_SYNC_NAME)
 
 
+def get_oauth_sync_state(extra_or_account: Any) -> dict[str, Any]:
+    return _get_sync_state(extra_or_account, OAUTH_SYNC_NAME)
+
+
 def has_cpa_upload_success(extra_or_account: Any) -> bool:
     state = get_cpa_sync_state(extra_or_account)
     return bool(state.get("uploaded") or state.get("uploaded_at"))
@@ -58,6 +67,46 @@ def has_cpa_upload_success(extra_or_account: Any) -> bool:
 def is_cli_proxy_enabled(extra_or_account: Any) -> bool:
     state = get_cli_proxy_sync_state(extra_or_account)
     return bool(state.get("enabled"))
+
+
+def _classify_oauth_message(msg: str) -> str:
+    text = str(msg or "").strip().lower()
+    if not text:
+        return "unknown"
+    phone_markers = (
+        "add_phone",
+        "phone",
+        "手机号",
+        "手机验证",
+        "smstome",
+        "号码池",
+    )
+    if any(marker in text for marker in phone_markers):
+        return "phone_required"
+    return "failed"
+
+
+def record_oauth_sync_result(extra: dict[str, Any], ok: bool, msg: str) -> dict[str, Any]:
+    """记录 OAuth 补齐结果，供前端明确标记是否还能免手机补 refresh_token。"""
+    sync_statuses = extra.get("sync_statuses")
+    if not isinstance(sync_statuses, dict):
+        sync_statuses = {}
+
+    state = sync_statuses.get(OAUTH_SYNC_NAME)
+    if not isinstance(state, dict):
+        state = {}
+
+    now = _utcnow_iso()
+    state["last_attempt_ok"] = bool(ok)
+    state["last_message"] = msg
+    state["last_attempt_at"] = now
+    state["status"] = "ready" if ok else _classify_oauth_message(msg)
+    if ok:
+        state["ready_at"] = now
+
+    sync_statuses[OAUTH_SYNC_NAME] = state
+    extra["sync_statuses"] = sync_statuses
+    return state
 
 
 def record_cpa_sync_result(extra: dict[str, Any], ok: bool, msg: str) -> dict[str, Any]:
@@ -109,6 +158,8 @@ def set_cli_proxy_sync_enabled(
 
 def build_chatgpt_sync_account(account: Any):
     extra = _get_account_extra(account)
+    access_token = extra.get("access_token") or getattr(account, "token", "")
+    client_id = str(extra.get("client_id") or "").strip() or OAUTH_CLIENT_ID
 
     class _SyncAccount:
         pass
@@ -116,11 +167,11 @@ def build_chatgpt_sync_account(account: Any):
     obj = _SyncAccount()
     obj.email = getattr(account, "email", "")
     obj.password = getattr(account, "password", "")
-    obj.access_token = extra.get("access_token") or getattr(account, "token", "")
+    obj.access_token = access_token
     obj.refresh_token = extra.get("refresh_token", "")
     obj.id_token = extra.get("id_token", "")
     obj.session_token = extra.get("session_token", "")
-    obj.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
+    obj.client_id = client_id
     obj.cookies = extra.get("cookies", "")
     return obj
 
@@ -200,6 +251,13 @@ def ensure_chatgpt_account_oauth(
     if not getattr(account, "password", ""):
         return False, "账号缺少 password", {}
 
+    logger.info(
+        "ChatGPT OAuth补齐开始 email=%s has_refresh_token=%s client_id=%s",
+        getattr(account, "email", ""),
+        bool(str(getattr(sync_account, "refresh_token", "") or "").strip()),
+        str(getattr(sync_account, "client_id", "") or "").strip() or "-",
+    )
+
     refresh_token = str(getattr(sync_account, "refresh_token", "") or "").strip()
     if refresh_token:
         manager = TokenRefreshManager(proxy_url=proxy_url)
@@ -208,15 +266,26 @@ def ensure_chatgpt_account_oauth(
             client_id=getattr(sync_account, "client_id", "") or None,
         )
         if refreshed.success:
+            logger.info("ChatGPT OAuth刷新成功 email=%s", getattr(account, "email", ""))
             return True, "已有 refresh_token，已完成 OAuth 刷新", {
                 "access_token": refreshed.access_token,
                 "refresh_token": refreshed.refresh_token or refresh_token,
             }
+        logger.warning(
+            "ChatGPT OAuth刷新失败 email=%s msg=%s",
+            getattr(account, "email", ""),
+            getattr(refreshed, "message", "") or getattr(refreshed, "error", "") or "refresh failed",
+        )
 
     # 旧账号缺 refresh_token 时，退回到邮箱 OTP 登录补抓。
     fingerprint = ChatGPTClient(proxy=proxy_url, verbose=False, browser_mode="protocol")
+    oauth_config = config_store.get_all().copy()
+    if getattr(sync_account, "client_id", ""):
+        # 优先沿用账号当前 access_token 对应的 client_id，避免继续拿错 OAuth 应用。
+        oauth_config["oauth_client_id"] = getattr(sync_account, "client_id", "")
+
     oauth_client = OAuthClient(
-        config=config_store.get_all(),
+        config=oauth_config,
         proxy=proxy_url,
         verbose=False,
         browser_mode="protocol",
@@ -234,11 +303,27 @@ def ensure_chatgpt_account_oauth(
         skymail_client=otp_adapter,
     )
     if not token_data:
+        logger.warning(
+            "ChatGPT OAuth登录失败 email=%s error=%s",
+            getattr(account, "email", ""),
+            oauth_client.last_error or "OAuth 登录未返回 token",
+        )
         return False, oauth_client.last_error or "OAuth 登录未返回 token", {}
 
+    token_data["client_id"] = str(token_data.get("client_id") or oauth_client.oauth_client_id or sync_account.client_id or "").strip()
     new_refresh_token = str(token_data.get("refresh_token") or "").strip()
     if not new_refresh_token:
+        logger.warning(
+            "ChatGPT OAuth登录未拿到refresh_token email=%s client_id=%s",
+            getattr(account, "email", ""),
+            token_data["client_id"] or "-",
+        )
         return False, "OAuth 登录成功，但未拿到 refresh_token", {}
+    logger.info(
+        "ChatGPT OAuth补齐成功 email=%s client_id=%s",
+        getattr(account, "email", ""),
+        token_data["client_id"] or "-",
+    )
     return True, "OAuth 凭据补齐成功", token_data
 
 
@@ -251,12 +336,21 @@ def upload_chatgpt_account_to_cpa(
         sync_account = build_chatgpt_sync_account(account)
         if not getattr(sync_account, "access_token", ""):
             return False, "账号缺少 access_token"
+        if not str(getattr(sync_account, "refresh_token", "") or "").strip():
+            return False, "账号缺少 refresh_token，禁止上传到 CLIProxyAPI"
 
         from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
 
+        logger.info("ChatGPT CPA上传开始 email=%s", getattr(account, "email", ""))
         token_data = generate_token_json(sync_account)
-        return upload_to_cpa(token_data, api_url=api_url, api_key=api_key)
+        ok, msg = upload_to_cpa(token_data, api_url=api_url, api_key=api_key)
+        if ok:
+            logger.info("ChatGPT CPA上传成功 email=%s", getattr(account, "email", ""))
+        else:
+            logger.warning("ChatGPT CPA上传失败 email=%s msg=%s", getattr(account, "email", ""), msg)
+        return ok, msg
     except Exception as exc:
+        logger.exception("ChatGPT CPA上传异常 email=%s", getattr(account, "email", ""))
         return False, f"上传异常: {exc}"
 
 
@@ -343,14 +437,27 @@ def ensure_account_model_oauth_and_upload_to_cpa(
     commit: bool = True,
 ) -> tuple[bool, str]:
     """先补 OAuth，再回传到 CLIProxyAPI，并把结果写回数据库。"""
+    logger.info("ChatGPT OAuth+CPA流程开始 account_id=%s email=%s", account.id, account.email)
     ok, oauth_msg, token_data = ensure_chatgpt_account_oauth(account, proxy_url=proxy_url)
     if not ok:
+        extra = account.get_extra()
+        record_oauth_sync_result(extra, False, oauth_msg)
+        account.set_extra(extra)
         update_account_model_cpa_sync(account, False, oauth_msg, session=session, commit=commit)
+        logger.warning(
+            "ChatGPT OAuth+CPA流程在OAuth阶段失败 account_id=%s email=%s msg=%s",
+            account.id,
+            account.email,
+            oauth_msg,
+        )
         return False, oauth_msg
 
     extra = account.get_extra()
+    # OAuth 成功后立即落库，避免前端仍显示旧的缺失状态。
+    record_oauth_sync_result(extra, True, oauth_msg)
     extra["access_token"] = str(token_data.get("access_token") or extra.get("access_token") or "").strip()
     extra["refresh_token"] = str(token_data.get("refresh_token") or extra.get("refresh_token") or "").strip()
+    extra["client_id"] = str(token_data.get("client_id") or extra.get("client_id") or "").strip()
     if token_data.get("id_token"):
         extra["id_token"] = str(token_data.get("id_token") or "").strip()
     if token_data.get("session_token"):
@@ -372,5 +479,12 @@ def ensure_account_model_oauth_and_upload_to_cpa(
         commit=commit,
     )
     if upload_ok:
+        logger.info("ChatGPT OAuth+CPA流程成功 account_id=%s email=%s", account.id, account.email)
         return True, f"{oauth_msg}；{upload_msg}"
+    logger.warning(
+        "ChatGPT OAuth+CPA流程在CPA阶段失败 account_id=%s email=%s msg=%s",
+        account.id,
+        account.email,
+        upload_msg,
+    )
     return False, upload_msg

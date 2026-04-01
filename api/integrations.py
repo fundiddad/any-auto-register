@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter
@@ -17,6 +18,8 @@ from services.chatgpt_sync import (
 )
 from services.cpa_manager import list_auth_files
 from services.external_apps import install, list_status, start, start_all, stop, stop_all
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -145,6 +148,12 @@ def backfill_chatgpt_oauth(body: ChatgptOAuthBackfillRequest):
     if not body.account_ids:
         return summary
 
+    logger.info(
+        "ChatGPT OAuth批量补齐请求 account_ids=%s only_enabled=%s",
+        body.account_ids,
+        body.only_enabled,
+    )
+
     with Session(engine) as s:
         rows = s.exec(
             select(AccountModel)
@@ -155,6 +164,7 @@ def backfill_chatgpt_oauth(body: ChatgptOAuthBackfillRequest):
         for row in rows:
             item = {"platform": row.platform, "email": row.email, "results": []}
             if body.only_enabled and not is_cli_proxy_enabled(row):
+                logger.warning("ChatGPT OAuth批量补齐跳过 email=%s reason=not_enabled", row.email)
                 item["results"].append(
                     {"name": "OAuth", "ok": False, "msg": "账号未标记为 CLIProxyAPI 账号"}
                 )
@@ -164,18 +174,28 @@ def backfill_chatgpt_oauth(body: ChatgptOAuthBackfillRequest):
                 continue
 
             try:
+                # 这里打印每个账号的处理结果，方便在后端日志里定位具体卡点。
+                logger.info("ChatGPT OAuth批量补齐开始 account_id=%s email=%s", row.id, row.email)
                 ok, msg = ensure_account_model_oauth_and_upload_to_cpa(
                     row,
                     session=s,
                     commit=False,
                 )
                 item["results"].append({"name": "OAuth+CPA", "ok": ok, "msg": msg})
+                logger.info(
+                    "ChatGPT OAuth批量补齐结束 account_id=%s email=%s ok=%s msg=%s",
+                    row.id,
+                    row.email,
+                    ok,
+                    msg,
+                )
                 if ok:
                     summary["success"] += 1
                 else:
                     summary["failed"] += 1
             except Exception as exc:
                 s.rollback()
+                logger.exception("ChatGPT OAuth批量补齐异常 account_id=%s email=%s", row.id, row.email)
                 item["results"].append({"name": "OAuth+CPA", "ok": False, "msg": str(exc)})
                 summary["failed"] += 1
             summary["total"] += 1
