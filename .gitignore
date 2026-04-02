@@ -56,3 +56,15 @@ CLAUDE.md
 .ace-tool/
 smstome*_numbers.txt
 smstome_used/
+
+# 本地备份与对比产物
+.codex-backups/
+.compare_upstream/
+
+# 本地缓存
+.pip-cache/
+.tmp/
+frontend/.npm-cache/
+
+# 本地导出文件
+accounts_passwords_*.csv

@@ -47,6 +47,8 @@ const STATUS_COLORS: Record<string, string> = {
   invalid: 'error',
 }
 
+const ACCOUNTS_FETCH_PAGE_SIZE = 200
+
 function parseExtraJson(raw: string | undefined) {
   if (!raw) return {}
   try {
@@ -491,6 +493,8 @@ export default function Accounts() {
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
+  const [tablePage, setTablePage] = useState(1)
+  const [tablePageSize, setTablePageSize] = useState(20)
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [addModalOpen, setAddModalOpen] = useState(false)
@@ -525,12 +529,35 @@ export default function Accounts() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ platform: currentPlatform, page: '1', page_size: '100' })
-      if (search) params.set('email', search)
-      if (filterStatus) params.set('status', filterStatus)
-      const data = await apiFetch(`/accounts?${params}`)
-      setAccounts((data.items || []).map(normalizeAccount))
-      setTotal(data.total)
+      let page = 1
+      let loadedTotal = 0
+      const mergedAccounts: any[] = []
+
+      // 后端是分页接口，这里主动翻页拉全量，避免前端只看到前 100 条账号。
+      while (true) {
+        const params = new URLSearchParams({
+          platform: currentPlatform,
+          page: String(page),
+          page_size: String(ACCOUNTS_FETCH_PAGE_SIZE),
+        })
+        if (search) params.set('email', search)
+        if (filterStatus) params.set('status', filterStatus)
+
+        const data = await apiFetch(`/accounts?${params}`)
+        const pageItems = (data.items || []).map(normalizeAccount)
+        loadedTotal = Number(data.total || 0)
+        mergedAccounts.push(...pageItems)
+
+        if (pageItems.length === 0 || mergedAccounts.length >= loadedTotal) {
+          break
+        }
+        page += 1
+      }
+
+      setAccounts(mergedAccounts)
+      setTotal(loadedTotal)
+      setTablePage(1)
+      setSelectedRowKeys((prev) => prev.filter((key) => mergedAccounts.some((account) => account.id === key)))
     } finally {
       setLoading(false)
     }
@@ -539,6 +566,15 @@ export default function Accounts() {
   useEffect(() => {
     load()
   }, [load])
+
+  const selectAllLoadedAccounts = () => {
+    // 全选按当前筛选结果生效，不只局限于当前分页。
+    setSelectedRowKeys(accounts.map((account) => account.id))
+  }
+
+  const clearSelectedAccounts = () => {
+    setSelectedRowKeys([])
+  }
 
   useEffect(() => {
     apiFetch(`/actions/${currentPlatform}`)
@@ -1144,7 +1180,17 @@ export default function Accounts() {
           {selectedRowKeys.length > 0 && (
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>
           )}
-        </Space>
+          {accounts.length > 0 && (
+            <Button size="small" onClick={selectAllLoadedAccounts}>
+              全选当前结果
+            </Button>
+          )}
+          {selectedRowKeys.length > 0 && (
+            <Button size="small" onClick={clearSelectedAccounts}>
+              清空选择
+            </Button>
+          )}
+</Space>
         <Space>
           {currentPlatform === 'chatgpt' && (
             <Dropdown
@@ -1206,8 +1252,21 @@ export default function Accounts() {
         rowSelection={{
           selectedRowKeys,
           onChange: setSelectedRowKeys,
+          selections: [Table.SELECTION_ALL, Table.SELECTION_INVERT, Table.SELECTION_NONE],
         }}
-        pagination={{ pageSize: 20, showSizeChanger: false }}
+        pagination={{
+          current: tablePage,
+          pageSize: tablePageSize,
+          total: accounts.length,
+          showSizeChanger: true,
+          showQuickJumper: true,
+          pageSizeOptions: ['20', '50', '100', '200'],
+          showTotal: (value) => `共 ${value} 个账号`,
+          onChange: (page, pageSize) => {
+            setTablePage(page)
+            setTablePageSize(pageSize)
+          },
+        }}
         scroll={{ x: isChatgptPlatform ? 1440 : 980 }}
         onRow={(record) => ({
           onDoubleClick: () => {
